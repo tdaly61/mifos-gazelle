@@ -25,6 +25,7 @@ class LocalDevPatcher:
         self.config_path = config_path.resolve()
         self.config = self._load_config()
         self.gazelle_home = Path(os.path.expandvars(self.config['general']['gazelle-home']))
+        self._fork_owner_cache: Optional[str] = None
     
     def _load_config(self) -> configparser.ConfigParser:
         """Load and parse the INI configuration file"""
@@ -70,132 +71,327 @@ class LocalDevPatcher:
             return False, str(e)
     
     def _get_current_branch(self, repo_path: Path) -> Optional[str]:
-        """Get the current branch of a git repository"""
+        """Get the current branch of a git repository ("HEAD" when detached)"""
         success, output = self._run_git_command(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], repo_path)
         return output if success else None
-    
+
     def _repo_exists(self, repo_path: Path) -> bool:
         """Check if a directory is a git repository"""
         if not repo_path.exists():
             return False
         success, _ = self._run_git_command(['git', 'rev-parse', '--git-dir'], repo_path)
         return success
-    
+
+    def _ref_exists(self, repo_path: Path, ref: str) -> bool:
+        success, _ = self._run_git_command(['git', 'rev-parse', '--verify', '--quiet', ref], repo_path)
+        return success
+
+    def _is_dirty(self, repo_path: Path) -> bool:
+        """True if tracked files have uncommitted changes"""
+        success, output = self._run_git_command(
+            ['git', 'status', '--porcelain', '--untracked-files=no'], repo_path)
+        return success and bool(output)
+
+    # ── Fork / repository resolution ─────────────────────────────────────────
+
+    def _opt(self, comp_config, key: str, default: str = '') -> str:
+        """Component option, falling back to [general], then to default."""
+        if key in comp_config:
+            return self._expand_vars(comp_config[key])
+        return self._expand_vars(self.config['general'].get(key, default))
+
+    def _fork_owner(self) -> Optional[str]:
+        """
+        GitHub user/org holding the developer's forks (see fork-phee-repos.sh).
+        LOCALDEV_FORK_OWNER overrides [general] fork_owner; "auto" means the
+        `gh` login. None means no fork: clone straight from upstream.
+        """
+        if self._fork_owner_cache is not None:
+            return self._fork_owner_cache or None
+
+        general = self.config['general']
+        owner = os.environ.get('LOCALDEV_FORK_OWNER') or general.get('fork_owner', 'auto')
+        owner = owner.strip()
+        if owner.lower() == 'auto':
+            try:
+                result = subprocess.run(['gh', 'api', 'user', '--jq', '.login'],
+                                        capture_output=True, text=True, timeout=15)
+                owner = result.stdout.strip() if result.returncode == 0 else ''
+            except Exception:
+                owner = ''
+            if not owner:
+                print("⚠️  fork_owner = auto but `gh` is not logged in — using upstream repos "
+                      "directly (run `gh auth login` or set fork_owner in localdev.ini)")
+        if owner.lower() in ('', 'none') or owner.lower() == general.get('upstream_owner', 'openMF').lower():
+            owner = ''
+
+        self._fork_owner_cache = owner
+        return owner or None
+
+    def _repo_info(self, component: str) -> Optional[dict]:
+        """
+        Resolve where a component's repo lives and which remotes it should have.
+
+        `repo = <name>`  → origin is <fork_owner>/<name>, upstream is <upstream_owner>/<name>
+        `reponame = URL` → origin is that URL, no upstream remote (repos that aren't forked)
+        """
+        comp_config = self.config[component]
+        base = self._opt(comp_config, 'base_branch', 'dev')
+        branch = self._expand_vars(comp_config.get('branch_or_tag', base))
+        checkout_to_dir = Path(self._opt(comp_config, 'checkout_to_dir', str(Path.home())))
+
+        if comp_config.get('repo'):
+            name = comp_config['repo'].strip()
+            upstream_url = f"https://github.com/{self._opt(comp_config, 'upstream_owner', 'openMF')}/{name}.git"
+            owner = self._fork_owner()
+            if owner:
+                if self._opt(comp_config, 'git_protocol', 'ssh') == 'https':
+                    origin_url = f"https://github.com/{owner}/{name}.git"
+                else:
+                    origin_url = f"git@github.com:{owner}/{name}.git"
+            else:
+                origin_url, upstream_url = upstream_url, None
+        elif comp_config.get('reponame'):
+            origin_url = comp_config['reponame'].strip()
+            upstream_url = None
+            name = origin_url.rstrip('/').split('/')[-1]
+            if name.endswith('.git'):
+                name = name[:-4]
+        else:
+            return None
+
+        return {
+            'name': name,
+            'origin': origin_url,
+            'upstream': upstream_url,
+            'branch': branch,
+            'base': base,
+            # Work branches are cut from upstream/<base>; without a fork, origin is upstream
+            'base_ref': f"{'upstream' if upstream_url else 'origin'}/{base}",
+            'path': checkout_to_dir / name,
+        }
+
+    def _hostpath(self, component: str) -> str:
+        """hostpath if set, else <checkout_to_dir>/<repo>[/<module>]"""
+        comp_config = self.config[component]
+        if comp_config.get('hostpath'):
+            return self._expand_vars(comp_config['hostpath'])
+        info = self._repo_info(component)
+        if not info:
+            return ''
+        path = info['path']
+        if comp_config.get('module'):
+            path = path / comp_config['module']
+        return str(path)
+
+    @staticmethod
+    def _repo_slug(url: str) -> str:
+        """owner/name from an ssh or https GitHub URL, lowercased, for comparisons"""
+        match = re.search(r'github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$', url)
+        return f"{match.group(1)}/{match.group(2)}".lower() if match else url.lower()
+
+    def _ensure_remotes(self, info: dict) -> None:
+        """
+        Add the upstream remote (fetch-only: push URL set to DISABLED) if missing.
+        A mismatched origin is reported but never changed — fork-phee-repos.sh
+        repoints clones whose origin is still upstream.
+        """
+        path = info['path']
+        success, current = self._run_git_command(['git', 'remote', 'get-url', 'origin'], path)
+        if success and self._repo_slug(current) != self._repo_slug(info['origin']):
+            print(f"  ⚠️  origin is {current}, expected {info['origin']} — left unchanged")
+
+        if not info['upstream']:
+            return
+        success, current = self._run_git_command(['git', 'remote', 'get-url', 'upstream'], path)
+        if not success:
+            self._run_git_command(['git', 'remote', 'add', 'upstream', info['upstream']], path)
+            self._run_git_command(['git', 'remote', 'set-url', '--push', 'upstream', 'DISABLED'], path)
+            print(f"  ➕ Added remote upstream → {info['upstream']} (push disabled)")
+        elif self._repo_slug(current) != self._repo_slug(info['upstream']):
+            print(f"  ⚠️  upstream is {current}, expected {info['upstream']} — left unchanged")
+
+    def _switch_branch(self, info: dict) -> bool:
+        """
+        Put the repo on info['branch']: an existing local branch, a branch on the
+        fork, or a tag. Otherwise create it — locally only — from base_ref.
+        Refuses to switch with uncommitted changes.
+        """
+        path, branch = info['path'], info['branch']
+        current = self._get_current_branch(path)
+        if current == branch:
+            return True
+        if self._is_dirty(path):
+            print(f"  ❌ Uncommitted changes on {current} — not switching to {branch}. Commit or stash first.")
+            return False
+
+        created = False
+        if self._ref_exists(path, f"refs/heads/{branch}"):
+            cmd = ['git', 'switch', branch]
+        elif self._ref_exists(path, f"refs/remotes/origin/{branch}"):
+            cmd = ['git', 'switch', '-c', branch, '--track', f"origin/{branch}"]
+        elif self._ref_exists(path, f"refs/tags/{branch}"):
+            cmd = ['git', 'switch', '--detach', f"refs/tags/{branch}"]
+        elif self._ref_exists(path, f"refs/remotes/{info['base_ref']}"):
+            cmd = ['git', 'switch', '--no-track', '-c', branch, info['base_ref']]
+            created = True
+        else:
+            print(f"  ❌ {branch} not found locally, on origin or as a tag, and {info['base_ref']} "
+                  f"doesn't exist to create it from")
+            return False
+
+        success, output = self._run_git_command(cmd, path)
+        if not success:
+            print(f"  ❌ Failed to switch to {branch}: {output}")
+            return False
+        if created:
+            print(f"  🌱 Created local branch {branch} from {info['base_ref']} "
+                  f"(not pushed — `git push -u origin {branch}` when ready)")
+        else:
+            print(f"  🔀 Switched to {branch}")
+        return True
+
+    def _behind_base(self, info: dict) -> Optional[int]:
+        """Commits on base_ref not in HEAD (from the last fetch), or None if unknown"""
+        success, output = self._run_git_command(
+            ['git', 'rev-list', '--count', f"HEAD..{info['base_ref']}"], info['path'])
+        return int(output) if success and output.isdigit() else None
+
+    def _fast_forward(self, info: dict) -> None:
+        """
+        Fast-forward only — never merges, rebases or pushes. The base branch follows
+        base_ref (upstream); a work branch follows its own tracking branch, if any.
+        """
+        path, branch = info['path'], info['branch']
+        if self._get_current_branch(path) == 'HEAD':
+            return  # tag / detached — nothing to follow
+        if branch == info['base']:
+            target = info['base_ref']
+        else:
+            success, target = self._run_git_command(
+                ['git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], path)
+            if not success:
+                target = None
+        if target:
+            success, output = self._run_git_command(['git', 'merge', '--ff-only', target], path)
+            if success:
+                print(f"  ✅ Up to date with {target}")
+            else:
+                print(f"  ⚠️  Can't fast-forward to {target} (diverged?) — left as is")
+        if branch != info['base']:
+            behind = self._behind_base(info)
+            if behind:
+                print(f"  ℹ️  {behind} commit(s) behind {info['base_ref']} — rebase/merge when ready")
+
     def checkout_component(self, component: str, update: bool = False) -> bool:
         """
         Checkout or update a component's repository
-        
+
         Args:
             component: Name of the component
-            update: If True, pull latest changes for existing repos
-        
+            update: If True, fetch, switch to branch_or_tag and fast-forward existing repos
+
         Returns:
             True if successful, False otherwise
         """
         if component not in self.config:
             print(f"❌ Component '{component}' not found in config")
             return False
-        
+
         comp_config = self.config[component]
-        
+
         # Check if checkout is enabled for this component
         if 'checkout_enabled' not in comp_config or comp_config['checkout_enabled'].lower() != 'true':
             print(f"⏭️  Skipping {component} - checkout not enabled")
             return True
-        
-        # Get configuration
-        if 'reponame' not in comp_config:
-            print(f"❌ Missing 'reponame' for {component}")
+
+        info = self._repo_info(component)
+        if not info:
+            print(f"❌ Missing 'repo' (or 'reponame') for {component}")
             return False
-        
-        reponame = comp_config['reponame']
-        branch_or_tag = comp_config.get('branch_or_tag', 'main')
-        checkout_to_dir = self._expand_vars(comp_config.get('checkout_to_dir', str(Path.home())))
-        
-        # Determine repository name from URL
-        repo_name = reponame.rstrip('/').split('/')[-1].replace('.git', '')
-        repo_path = Path(checkout_to_dir) / repo_name
-        
+        repo_path = info['path']
+
         print(f"\n{'Processing' if not update else 'Updating'} {component}...")
-        print(f"  📦 Repository: {reponame}")
-        print(f"  🌿 Branch/Tag: {branch_or_tag}")
+        print(f"  📦 Repository: {info['origin']}")
+        if info['upstream']:
+            print(f"  ⬆️  Upstream  : {info['upstream']}")
+        print(f"  🌿 Branch/Tag: {info['branch']}")
         print(f"  📁 Target: {repo_path}")
-        
-        # Check if repo already exists
+
         if self._repo_exists(repo_path):
-            if update:
-                print(f"  🔄 Repository exists, updating...")
-                
-                # Fetch latest
-                success, output = self._run_git_command(['git', 'fetch', '--all'], repo_path)
-                if not success:
-                    print(f"  ⚠️  Warning: Failed to fetch: {output}")
-                
-                # Check current branch
-                current_branch = self._get_current_branch(repo_path)
-                print(f"  📍 Current branch: {current_branch}")
-                
-                # Checkout desired branch/tag if different
-                if current_branch != branch_or_tag:
-                    print(f"  🔀 Switching to {branch_or_tag}...")
-                    success, output = self._run_git_command(['git', 'checkout', branch_or_tag], repo_path)
-                    if not success:
-                        print(f"  ❌ Failed to checkout {branch_or_tag}: {output}")
-                        return False
-                
-                # Pull latest changes
-                success, output = self._run_git_command(['git', 'pull'], repo_path)
-                if success:
-                    print(f"  ✅ Updated successfully")
-                else:
-                    print(f"  ⚠️  Warning: Failed to pull: {output}")
-                
+            self._ensure_remotes(info)
+            if not update:
+                current = self._get_current_branch(repo_path)
+                print(f"  ℹ️  Repository already exists (on {current})")
+                if current != info['branch']:
+                    print(f"  💡 Use --update to switch to {info['branch']}")
                 return True
-            else:
-                print(f"  ℹ️  Repository already exists at {repo_path}")
-                print(f"  💡 Use --update to pull latest changes")
-                return True
-        
+
+            print(f"  🔄 Repository exists, updating...")
+            success, output = self._run_git_command(['git', 'fetch', '--all', '--prune'], repo_path)
+            if not success:
+                print(f"  ⚠️  Warning: Failed to fetch: {output}")
+            if not self._switch_branch(info):
+                return False
+            self._fast_forward(info)
+            return True
+
         # Clone the repository
         print(f"  📥 Cloning repository...")
-        
-        # Ensure parent directory exists
-        Path(checkout_to_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Clone with specific branch
-        clone_cmd = ['git', 'clone', '--branch', branch_or_tag, reponame, str(repo_path)]
-        success, output = self._run_git_command(clone_cmd, Path(checkout_to_dir))
-        
-        if success:
-            print(f"  ✅ Cloned successfully")
-            return True
-        else:
+        Path(repo_path.parent).mkdir(parents=True, exist_ok=True)
+        success, output = self._run_git_command(
+            ['git', 'clone', info['origin'], str(repo_path)], repo_path.parent)
+        if not success:
             print(f"  ❌ Clone failed: {output}")
+            if info['upstream']:
+                print(f"  💡 No fork yet? Run src/utils/localdev/fork-phee-repos.sh "
+                      f"-o {self._fork_owner()} -r {info['name']}")
             return False
-    
+
+        self._ensure_remotes(info)
+        if info['upstream']:
+            self._run_git_command(['git', 'fetch', 'upstream'], repo_path)
+        if not self._switch_branch(info):
+            return False
+        print(f"  ✅ Cloned successfully")
+        return True
+
     def checkout_all(self, update: bool = False):
         """Checkout all components with checkout_enabled = true"""
         components = self.get_components()
         enabled_components = [
-            c for c in components 
-            if c in self.config and 
+            c for c in components
+            if c in self.config and
             self.config[c].get('checkout_enabled', '').lower() == 'true'
         ]
-        
+
         if not enabled_components:
             print("\n⚠️  No components have checkout_enabled = true")
             print("Update your localdev.ini to enable checkout for components")
             return
-        
+
         print(f"\n{'=' * 60}")
         print(f"{'Checking out' if not update else 'Updating'} {len(enabled_components)} component(s)")
         print(f"{'=' * 60}")
-        
+
+        # Several components can share one repo (e.g. data-pipeline modules):
+        # process it once, and flag sections that ask for different branches.
+        seen = {}
         success_count = 0
         for component in enabled_components:
+            info = self._repo_info(component)
+            if info and info['path'] in seen:
+                first, first_branch = seen[info['path']]
+                if info['branch'] != first_branch:
+                    print(f"\n⚠️  {component} wants {info['branch']} but shares {info['path']} "
+                          f"with {first} ({first_branch}) — using {first_branch}")
+                success_count += 1
+                continue
+            if info:
+                seen[info['path']] = (component, info['branch'])
             if self.checkout_component(component, update):
                 success_count += 1
-        
+
         print(f"\n{'=' * 60}")
         print(f"✅ Successfully processed {success_count}/{len(enabled_components)} components")
         print(f"{'=' * 60}\n")
@@ -292,15 +488,15 @@ class LocalDevPatcher:
             comp_config = self.config[component]
 
             # ── Repo column ───────────────────────────────────────────────────
-            if comp_config.get('checkout_enabled', '').lower() == 'true':
-                checkout_to_dir = self._expand_vars(comp_config.get('checkout_to_dir', str(Path.home())))
-                reponame = comp_config.get('reponame', '')
-                repo_name = reponame.rstrip('/').split('/')[-1].replace('.git', '')
-                repo_path = Path(checkout_to_dir) / repo_name
-                expected = comp_config.get('branch_or_tag', 'main')
-                if self._repo_exists(repo_path):
-                    current = self._get_current_branch(repo_path)
+            info = self._repo_info(component) if comp_config.get('checkout_enabled', '').lower() == 'true' else None
+            if info:
+                if self._repo_exists(info['path']):
+                    current = self._get_current_branch(info['path'])
+                    expected = info['branch']
                     co_col = f"✅ {current}" if current == expected else f"⚠️  {current} (want {expected})"
+                    behind = self._behind_base(info)
+                    if behind:
+                        co_col += f" ↓{behind}"
                 else:
                     co_col = "❌ not cloned"
             else:
@@ -474,7 +670,7 @@ class LocalDevPatcher:
         k8s_namespace = comp_config.get('k8s_namespace', 'paymenthub')
         image = comp_config.get('image', '')
         jarpath = comp_config.get('jarpath', '')
-        hostpath = self._expand_vars(comp_config.get('hostpath', ''))
+        hostpath = self._hostpath(component)
         app_type = comp_config.get('app_type', 'springboot')
 
         backup_dir = Path.home() / '.localdev-backups'
@@ -503,6 +699,16 @@ class LocalDevPatcher:
                   f"Re-patching and refreshing the backup.")
 
         print(f"\n{'[DRY RUN] ' if dry_run else ''}Processing {component} (k8s direct-patch)...")
+
+        # Check the host side before touching the cluster: a missing hostPath
+        # directory leaves the pod stuck in ContainerCreating.
+        if not Path(hostpath).is_dir():
+            print(f"  ❌ Host path {hostpath} does not exist — run --checkout first")
+            return False
+        if app_type == 'springboot':
+            jarpath = self._resolve_jarpath(component, hostpath)
+            if not jarpath:
+                return False
         print(f"  📦 Deployment : {k8s_deploy_name}  ns: {k8s_namespace}")
         if app_type == 'springboot':
             print(f"  🖼️  Image      : {image}")
@@ -601,6 +807,30 @@ class LocalDevPatcher:
              '-n', k8s_namespace, '--timeout=120s']
         )
         return True
+
+    def _resolve_jarpath(self, component: str, hostpath: str) -> Optional[str]:
+        """
+        Container path of the jar to run. Uses jarpath when set and present on the
+        host; otherwise the boot jar in <hostpath>/build/libs (ignoring *-plain.jar,
+        newest wins if there are several), so jar renames don't break patching.
+        """
+        configured = self.config[component].get('jarpath', '').strip()
+        libs = Path(hostpath) / 'build' / 'libs'
+        if configured and configured.lower() != 'auto':
+            if not configured.startswith('/app/'):
+                return configured
+            if (Path(hostpath) / configured[len('/app/'):]).is_file():
+                return configured
+            print(f"  ⚠️  jarpath {configured} not found on host — looking in {libs}")
+
+        jars = [j for j in libs.glob('*.jar') if not j.name.endswith('-plain.jar')] if libs.is_dir() else []
+        if not jars:
+            print(f"  ❌ No boot jar in {libs} — build first (e.g. ./gradlew bootJar)")
+            return None
+        jar = max(jars, key=lambda j: j.stat().st_mtime)
+        if len(jars) > 1:
+            print(f"  ⚠️  {len(jars)} jars in {libs} — using the newest, {jar.name}")
+        return f"/app/build/libs/{jar.name}"
 
     def _restore_k8s_deployment(self, component: str) -> bool:
         """Restore an operator-managed deployment patched via _patch_k8s_deployment."""
@@ -709,7 +939,7 @@ Examples:
   # Just checkout component repositories
   ./localdev.py --checkout
 
-  # Update existing repos (pull latest)
+  # Fetch, switch to each branch_or_tag, fast-forward (never pushes)
   ./localdev.py --update
 
   # Dry run - see what would be changed
@@ -754,12 +984,12 @@ Examples:
     parser.add_argument(
         '--checkout',
         action='store_true',
-        help='Checkout component repositories (components with checkout_enabled=true)'
+        help='Clone missing component repositories (components with checkout_enabled=true)'
     )
     parser.add_argument(
         '--update',
         action='store_true',
-        help='Update existing component repositories (pull latest changes)'
+        help='Fetch, switch to branch_or_tag (creating it from upstream/<base_branch> if new) and fast-forward'
     )
     parser.add_argument(
         '--setup',

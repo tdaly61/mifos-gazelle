@@ -10,14 +10,15 @@
 
 All PHEE components are **operator-managed**: deployed by the PaymentHub Kubernetes operator from `PaymentHubDeployment` CRs in `src/deployer/operators/paymenthub/config/cr/`. `localdev.py` patches live Kubernetes Deployments directly via `kubectl get/apply` (k8s-direct-mode).
 
-> **Naming note:** the upstream `openMF/ph-ee-*` repos are being renamed to `paymenthub-ee-*`. In-cluster Kubernetes Deployment/pod names have mostly already moved to `paymenthub-ee-*`, but a few source repos (and therefore local checkout directories) haven't been renamed upstream yet — e.g. `ph-ee-operations-web`, `ph-ee-importer-rdbms`, `ph-ee-zeebe-ops`. The tables below reflect the current, mixed state; always verify with `kubectl get deployments -n paymenthub` before assuming a name.
+> **Naming note:** the services now live in `openMF/paymenthub-ee-*` repos (some consolidated: `paymenthub-ee-data-pipeline` holds importer-rdbms, importer-es and zeebe-ops). Always verify Deployment names with `kubectl get deployments -n paymenthub`.
 
 ### Files
 
 | File | Purpose |
 |------|---------|
 | `localdev.py` | Main script — patches Deployments and manages repo checkouts |
-| `localdev.ini` | Configuration: which components to patch and where your local repos live |
+| `localdev.ini` | Configuration: which components to patch, your fork owner and branches |
+| `fork-phee-repos.sh` | Forks the openMF `paymenthub-ee-*` repos to your account and sets up local clones (see [Working From Forks](#working-from-forks)) |
 
 ---
 
@@ -36,25 +37,24 @@ cd ~/mifos-gazelle/src/utils/localdev
 # 1. Check current state
 ./localdev.py --status
 
-# 2. Setup a component (checkout repo + patch deployment)
+# 2. Clone the repo / switch to your branch (branch_or_tag in localdev.ini)
+./localdev.py --update --component importer-rdbms
+
+# 3. Build the JAR (Java 21)
+cd ~/paymenthub-ee-data-pipeline/importer-rdbms
+./gradlew bootJar
+
+# 4. Patch the deployment to run your JAR
+cd ~/mifos-gazelle/src/utils/localdev
 ./localdev.py --setup --component importer-rdbms
-
-# 3. Build the JAR (must use Java 17 — see note below)
-cd ~/ph-ee-importer-rdbms
-JAVA_HOME=/home/mifosu/jdk-17.0.2 ./gradlew build -x test
-
-# 4. Restart the pod to pick up the new JAR
-kubectl delete pod -n paymenthub -l app=paymenthub-ee-importer-rdbms
+# after each rebuild: kubectl delete pod -n paymenthub -l app=paymenthub-ee-importer-rdbms
 
 # 5. When done, restore the original deployment
 cd ~/mifos-gazelle/src/utils/localdev
 ./localdev.py --restore --component importer-rdbms
 ```
 
-> **Java version:** PHEE components target Java 17. The system Java may be newer (e.g., 23) and will fail to build. Always use:
-> ```bash
-> JAVA_HOME=/home/mifosu/jdk-17.0.2 ./gradlew build -x test
-> ```
+> **Java version:** the `paymenthub-ee-*` repos target Java 21 (`eclipse-temurin:21` at runtime). Check `java -version`, or set `JAVA_HOME` to a JDK 21, before building.
 
 ---
 
@@ -65,7 +65,7 @@ For components with `k8s_deploy_name` in `localdev.ini`, the patcher:
 1. Runs `kubectl get deployment <name> -n <namespace> -o json` to fetch the live Deployment
 2. Saves the original as a JSON backup at `~/.localdev-backups/<component>-deployment.json`
 3. Modifies the Deployment spec:
-   - Overrides the container image with the JDK image (e.g., `eclipse-temurin:17`)
+   - Overrides the container image with the JDK image (e.g., `eclipse-temurin:21`)
    - Adds `command: ["java", "-jar", "<jarpath>"]`
    - Adds a `volumeMount` at `/app` in the container
    - Adds a `hostPath` volume pointing to your local project directory
@@ -94,11 +94,12 @@ For components with `k8s_deploy_name` in `localdev.ini`, the patcher:
 ./localdev.py --setup
 ./localdev.py --setup --component importer-rdbms   # single component
 
-# Clone repositories (components with checkout_enabled = true)
+# Clone missing repositories (components with checkout_enabled = true)
 ./localdev.py --checkout
 ./localdev.py --checkout --component channel
 
-# Pull latest changes for existing repos
+# Fetch, switch to branch_or_tag (created from upstream/<base_branch> if new),
+# fast-forward. Never pushes, merges or rebases; won't switch over uncommitted changes.
 ./localdev.py --update
 ./localdev.py --update --component channel
 
@@ -123,12 +124,38 @@ For components with `k8s_deploy_name` in `localdev.ini`, the patcher:
 ## Build Loop
 
 ```bash
-cd ~/ph-ee-importer-rdbms
+cd ~/paymenthub-ee-data-pipeline/importer-rdbms
 # ... edit Java files ...
-JAVA_HOME=/home/mifosu/jdk-17.0.2 ./gradlew build -x test
+./gradlew bootJar          # Java 21
 kubectl delete pod -n paymenthub -l app=paymenthub-ee-importer-rdbms
 kubectl logs -f -n paymenthub -l app=paymenthub-ee-importer-rdbms
 ```
+
+---
+
+## Working From Forks
+
+openMF branch protection blocks new branches on the `paymenthub-ee-*` repos, so
+work happens in personal forks. One-off setup:
+
+```bash
+gh auth login                      # once; add `-s workflow` so fork syncs can include CI changes
+src/utils/localdev/fork-phee-repos.sh            # prompts for the fork owner (default: your gh login)
+src/utils/localdev/fork-phee-repos.sh -h         # options: owner/org, clone dir, repo subset, ssh/https
+```
+
+Each clone then has `origin` = your fork and `upstream` = openMF (HTTPS, push
+URL set to `DISABLED`). localdev.py builds the same remotes from `[general]`
+(`fork_owner`, `upstream_owner`, `git_protocol`); `LOCALDEV_FORK_OWNER` overrides
+`fork_owner` without editing the ini.
+
+Per ticket:
+
+1. Set `branch_or_tag` in the component's section to your branch name
+2. `./localdev.py --update --component <name>` — creates the branch from `upstream/dev` if it's new
+3. Build (`./gradlew bootJar`), then `./localdev.py --setup --component <name>`
+4. Commit; push to your fork and open the PR against openMF `dev`
+5. `./localdev.py --restore --component <name>`
 
 ---
 
@@ -148,16 +175,26 @@ The operator itself (`paymenthub-operator`) uses plain k8s-direct mode too — i
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `[general].gazelle-home` | Yes | Root path to your mifos-gazelle clone |
+| `[general].fork_owner` | No | GitHub user/org holding your forks: `auto` (default, your `gh` login), a name, or `none` to clone upstream directly |
+| `[general].upstream_owner` | No | Upstream owner (default: `openMF`) |
+| `[general].git_protocol` | No | `ssh` (default) or `https`, for `origin` |
+| `checkout_to_dir` | No | Directory to clone into (default: `$HOME`; set in `[general]` or per section) |
+| `base_branch` | No | Upstream branch new work branches are cut from (default: `dev`; `[general]` or per section) |
 | `k8s_deploy_name` | k8s-direct | Kubernetes Deployment name (`kubectl get deployments -n paymenthub`) |
 | `k8s_namespace` | k8s-direct | Namespace of the Deployment (default: `paymenthub`) |
-| `app_type` | No | `springboot` (default) |
-| `image` | springboot | JDK container image, e.g. `eclipse-temurin:17` |
-| `jarpath` | springboot | Path to JAR inside container, e.g. `/app/build/libs/app.jar` |
-| `hostpath` | k8s-direct | Local filesystem path mounted at `/app` inside the container |
+| `app_type` | No | `springboot` (default) or `webapp` |
+| `image` | springboot | JDK container image, e.g. `eclipse-temurin:21` |
+| `hostpath` | No | Local path mounted at `/app` (default: `<checkout_to_dir>/<repo>[/<module>]`) |
+| `jarpath` | No | Path to JAR inside the container. Default: the boot jar auto-detected in `<hostpath>/build/libs` (`*-plain.jar` ignored, newest wins) |
 | `checkout_enabled` | No | `true` to enable automatic repo clone/update |
-| `reponame` | If checkout | Git URL (HTTPS or SSH) |
-| `branch_or_tag` | No | Branch, tag, or commit SHA (default: `main`) |
-| `checkout_to_dir` | No | Directory to clone into (default: `$HOME`) |
+| `repo` | If checkout | Repo name, e.g. `paymenthub-ee-connector-channel`; URLs come from `[general]` |
+| `reponame` | — | Full git URL instead of `repo`, for repos that aren't forked (no `upstream` remote) |
+| `module` | No | Subdirectory of a multi-module repo that holds the service |
+| `branch_or_tag` | No | Your working branch or a tag (default: `base_branch`) |
+
+Sections sharing one repo (`importer-rdbms`/`zeebe-ops`/`importer-es`,
+`mock-payment`/`integration-test`) share one working tree, so give them the same
+`branch_or_tag`.
 
 ### Variable Expansion
 
@@ -171,38 +208,38 @@ The operator itself (`paymenthub-operator`) uses plain k8s-direct mode too — i
 k8s_deploy_name = paymenthub-ee-my-component   # verify with: kubectl get deployments -n paymenthub
 k8s_namespace   = paymenthub
 app_type        = springboot
-image           = eclipse-temurin:17
-jarpath         = /app/build/libs/my-component.jar
-hostpath        = ${HOME}/my-component-repo
+image           = eclipse-temurin:21
 checkout_enabled = true
-reponame        = https://github.com/openMF/my-component.git
+repo            = paymenthub-ee-my-component
 branch_or_tag   = dev
-checkout_to_dir = ${HOME}
 ```
 
 ---
 
 ## Configured Components
 
-| Section | Mode | Checkout branch | k8s Deployment name |
-|---------|------|-----------------|---------------------|
-| `paymenthub-operator` | k8s-direct | main | `paymenthub-ee-operator` |
-| `channel` | k8s-direct | dev | `paymenthub-ee-connector-channel` |
-| `bulk-processor` | k8s-direct | dev | `paymenthub-ee-bulk-processor` |
-| `mock-payment` | k8s-direct | dev | `paymenthub-ee-connector-mock-payment-schema` |
-| `operations-web` | k8s-direct | dev | `ph-ee-operations-web` — not yet renamed upstream; the two candidate replacement repos (`paymenthub-ee-operationsui-react`, `paymenthub-ee-operationsui-angular`) are scaffold-only |
-| `importer-rdbms` | k8s-direct | dev | `paymenthub-ee-importer-rdbms` |
-| `ams-mifos` | k8s-direct | dev | `paymenthub-ee-connector-ams-mifosx` |
-| `connector-mojaloop` | k8s-direct | dev | `paymenthub-ee-connector-mojaloop` |
-| `bill-pay` | k8s-direct | dev | `paymenthub-ee-p2g` |
-| `connector-bulk` | checkout-only | dev | — |
-| `operations-app` | checkout-only | dev | — (repo renamed/merged into `paymenthub-ee-bff`) |
-| `identity-account-mapper` | checkout-only | dev | — (repo renamed to `paymenthub-ee-account-mapper`) |
-| `zeebe-ops` | checkout-only | dev | — (repo still `ph-ee-zeebe-ops`) |
-| `connector-mccbs` | checkout-only | dev | — (separate operator; repo still `ph-ee-connector-mccbs`) |
-| `connector-gsma` | checkout-only | dev | — (repo renamed to `paymenthub-ee-connector-mm-gsma`) |
-| `integration-test` | checkout-only | dev | — (test suite; now a module of `paymenthub-ee-e2e-tests`, shared with `mock-payment`) |
-| `notifications` | checkout-only | dev | — |
+| Section | Repo (`module`) | k8s Deployment name |
+|---------|-----------------|---------------------|
+| `paymenthub-operator` | `paymenthub-ee-k8s-operators` (`paymenthub-operator`) | `paymenthub-ee-operator` |
+| `channel` | `paymenthub-ee-connector-channel` | `paymenthub-ee-connector-channel` |
+| `bulk-processor` | `paymenthub-ee-bulk-processor` | `paymenthub-ee-bulk-processor` |
+| `connector-bulk` | `paymenthub-ee-connector-bulk` | `paymenthub-ee-connector-bulk` |
+| `mock-payment` | `paymenthub-ee-e2e-tests` (`mock-payment-schema`) | `paymenthub-ee-connector-mock-payment-schema` |
+| `operations-app` | `paymenthub-ee-bff` | `paymenthub-ee-bff` |
+| `operationsui-react` | `paymenthub-ee-operationsui-react` (`dist`, webapp) | `paymenthub-ee-operationsui-react` |
+| `importer-rdbms` | `paymenthub-ee-data-pipeline` (`importer-rdbms`) | `paymenthub-ee-importer-rdbms` |
+| `zeebe-ops` | `paymenthub-ee-data-pipeline` (`zeebe-ops`) | `paymenthub-ee-zeebe-ops` |
+| `importer-es` | `paymenthub-ee-data-pipeline` (`importer-es`) | `paymenthub-ee-importer-es` (CR disabled by default) |
+| `identity-account-mapper` | `paymenthub-ee-account-mapper` | `paymenthub-ee-account-mapper` |
+| `ams-mifos` | `paymenthub-ee-connector-ams-mifosx` | `paymenthub-ee-connector-ams-mifosx` |
+| `connector-mojaloop` | `paymenthub-ee-connector-mojaloop` | `paymenthub-ee-connector-mojaloop` |
+| `notifications` | `paymenthub-ee-notifications` | `paymenthub-ee-notifications` |
+| `vouchers` | `paymenthub-ee-vouchers` | `paymenthub-ee-vouchers` |
+| `bill-pay` | `paymenthub-ee-p2g` (`p2g`) | `paymenthub-ee-p2g` |
+| `connector-gsma` | `paymenthub-ee-connector-mm-gsma` | `paymenthub-ee-connector-mm-gsma` (CR disabled by default) |
+| `integration-test` | `paymenthub-ee-e2e-tests` (`integration-test`) | — checkout only (test suite) |
+| `auth`, `core`, `dpg-core`, `connector-ams-paygops`, `connector-crm`, `connector-mpesa`, `connector-slcb`, `operationsui-angular` | `paymenthub-ee-<section>` | — checkout only |
+| `connector-mccbs` | `ph-ee-connector-mccbs` (`reponame`, not forked) | — separate operator |
 
 ---
 
@@ -250,8 +287,9 @@ kubectl logs -n paymenthub -l app=your-component
 
 ### Build fails with Java version error
 ```bash
-# Use Java 17 explicitly — system Java may be newer
-JAVA_HOME=/home/mifosu/jdk-17.0.2 ./gradlew build -x test
+# paymenthub-ee-* repos target Java 21
+java -version
+./gradlew bootJar
 ```
 
 ### Pod in CrashLoopBackOff after patching
@@ -264,8 +302,8 @@ kubectl exec -n paymenthub deployment/your-component -- ls -la /app/build/libs/
 ```
 
 Common causes:
-- Wrong JAR filename in `jarpath` — check `build.gradle` for the actual artifact name
-- JAR not yet built — run `JAVA_HOME=/home/mifosu/jdk-17.0.2 ./gradlew build -x test`
+- A forced `jarpath` that no longer matches the built jar — remove it to use auto-detection
+- JAR not yet built — run `./gradlew bootJar` (localdev refuses to patch when `build/libs` has no boot jar)
 - `hostpath` directory does not exist on the node
 
 ### Patch reverted by operator
@@ -287,7 +325,7 @@ rm ~/.localdev-backups/<component>-deployment.json
 ### Configuration changes not taking effect
 When using hostPath mounts, the Spring Boot JAR contains the compiled YAML configuration. Editing `application.yaml` alone is not sufficient — rebuild the JAR:
 ```bash
-JAVA_HOME=/home/mifosu/jdk-17.0.2 ./gradlew build -x test
+./gradlew bootJar
 kubectl delete pod -n paymenthub -l app=your-component
 ```
 ConfigMap changes do NOT take effect when using hostPath mounts — the in-JAR config takes precedence.

@@ -153,6 +153,16 @@ Operator CRs and configs live in `src/deployer/operators/`. PaymentHub EE (`paym
 - `postman/` — Postman collections for API testing
 - `docs/` — project documentation
 
+## PH-EE Workflow (paymenthub-ee-* repos)
+
+Changes to the `openMF/paymenthub-ee-*` repos are made in personal forks, because openMF branch protection blocks new branches.
+
+- `src/utils/localdev/fork-phee-repos.sh` creates the forks and clones. Each clone lives at `~/paymenthub-ee-<name>`, with `origin` = the developer's fork (SSH) and `upstream` = openMF (HTTPS, push URL `DISABLED`).
+- `localdev.py` reads `fork_owner` / `upstream_owner` from `src/utils/localdev/localdev.ini`. The `LOCALDEV_FORK_OWNER` env var overrides it.
+- Ticket branches are cut from `upstream/dev`. Ask the developer for the branch name before creating one.
+- Claude may make **local commits only**. Claude never pushes, syncs forks, forks repos, or opens or merges PRs. The developer reviews `git diff upstream/dev...`, pushes, and raises PRs. Claude may draft PR text.
+- If a non-Mifos Helm chart or Docker image has changed upstream and breaks the deployment, stop and report it. Do not work around it.
+
 ## macOS-Specific Notes
 
 - `run.sh` auto-installs Homebrew bash 4+ if needed (system `/bin/bash` is 3.2)
