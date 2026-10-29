@@ -61,8 +61,9 @@ src/utils/kibana-dashboard-setup.sh
 
 ### Local Development
 ```bash
-# Patches live Kubernetes Deployments (hostPath + local JAR) for local dev — requires a live cluster
+# Runs components from local JARs (hostPath) via spec.localDev on their operator CR — requires a live cluster
 python src/utils/localdev/localdev.py
+python src/utils/localdev/localdev.py --restart --component <name>   # after rebuilding a JAR
 ```
 
 ### Logging

@@ -1,5 +1,23 @@
 # Local Development Tools for Payment Hub EE
 
+## Contents
+
+- [Overview](#overview)
+- [Quick Start](#quick-start)
+- [Reading `--status`](#reading---status)
+- [How CR mode Works](#how-cr-mode-works)
+- [How k8s-direct mode Works](#how-k8s-direct-mode-works)
+- [Command Reference](#command-reference)
+- [Build Loop](#build-loop)
+- [Working From Forks](#working-from-forks)
+- [localdev.ini Configuration](#localdevini-configuration)
+- [Configured Components](#configured-components)
+- [Running the Operator From a Local Build](#running-the-operator-from-a-local-build)
+- [Troubleshooting](#troubleshooting)
+- [Notes](#notes)
+
+---
+
 ## Overview
 
 `src/utils/localdev/` contains tools for iterating on Payment Hub EE Java components without rebuilding Docker images or pushing to a registry.
@@ -8,7 +26,7 @@
 
 **The Solution:** `localdev.py` mounts your local project directory into the running pod via a `hostPath` volume. You rebuild the JAR locally and restart the pod — no Docker build required.
 
-All PHEE components are **operator-managed**: deployed by the PaymentHub Kubernetes operator from `PaymentHubDeployment` CRs in `src/deployer/operators/paymenthub/config/cr/`. `localdev.py` patches live Kubernetes Deployments directly via `kubectl get/apply` (k8s-direct-mode).
+All PHEE components are **operator-managed**: the PaymentHub Kubernetes operator deploys them from `PaymentHubDeployment` CRs in `src/deployer/operators/paymenthub/config/cr/`. `localdev.py` sets `spec.localDev` on a component's CR, and the operator renders the hostPath Deployment itself. The operator keeps it on every reconcile, so there's nothing to scale down and nothing gets reverted ([CR mode](#how-cr-mode-works)). The operator's own Deployment has no CR, so it's patched directly ([k8s-direct mode](#how-k8s-direct-mode-works)).
 
 > **Naming note:** the services now live in `openMF/paymenthub-ee-*` repos (some consolidated: `paymenthub-ee-data-pipeline` holds importer-rdbms, importer-es and zeebe-ops). Always verify Deployment names with `kubectl get deployments -n paymenthub`.
 
@@ -44,12 +62,13 @@ cd ~/mifos-gazelle/src/utils/localdev
 cd ~/paymenthub-ee-data-pipeline/importer-rdbms
 ./gradlew bootJar
 
-# 4. Patch the deployment to run your JAR
+# 4. Run your JAR in the cluster (sets spec.localDev on the CR)
 cd ~/mifos-gazelle/src/utils/localdev
 ./localdev.py --setup --component importer-rdbms
-# after each rebuild: kubectl delete pod -n paymenthub -l app=paymenthub-ee-importer-rdbms
+# after each rebuild:
+./localdev.py --restart --component importer-rdbms
 
-# 5. When done, restore the original deployment
+# 5. When done, go back to the image
 cd ~/mifos-gazelle/src/utils/localdev
 ./localdev.py --restore --component importer-rdbms
 ```
@@ -58,9 +77,67 @@ cd ~/mifos-gazelle/src/utils/localdev
 
 ---
 
-## How k8s-direct-mode Works
+## Reading `--status`
 
-For components with `k8s_deploy_name` in `localdev.ini`, the patcher:
+```
+  ── deployable  (run your build in the cluster) ──────────────────────────────
+  COMPONENT            BRANCH                                   UPSTREAM   RUNNING
+  paymenthub-operator  ⚠️  PHEE-455-operator-localdev (ini: dev)  1 behind   🔧 local JAR  (direct)
+  channel              ✅ dev                                   current    📦 image dev-4252b33
+```
+
+| Column | Value | Meaning |
+|--------|-------|---------|
+| BRANCH | `✅ dev` | The clone is on the `branch_or_tag` set in `localdev.ini` |
+| | `⚠️  <branch> (ini: dev)` | The clone is on another branch. Normal while you work on a ticket. Set `branch_or_tag` to the branch if you want `--update` to stay on it |
+| | `❌ not cloned` | Run `--checkout` |
+| UPSTREAM | `N behind` / `current` | Commits on `upstream/<base_branch>` that aren't in your branch. Uses the last fetch; `--update` fetches |
+| RUNNING | `🔧 local JAR (CR)` | Your build, through `spec.localDev` on the CR ([CR mode](#how-cr-mode-works)). Webapps show `local files` |
+| | `🔧 local JAR (direct)` | Your build, through a direct Deployment patch ([k8s-direct mode](#how-k8s-direct-mode-works)) |
+| | `📦 image <tag>` | The registry image |
+| | `… (stale backup — run --clean-backups)` | A k8s-direct backup is left over after a redeploy put the image back |
+| | `⚠️  reverted → …` | A backup exists but the Deployment no longer runs your build |
+
+Components under **checkout only** have no Deployment to patch, so they have no RUNNING column.
+
+---
+
+## How CR mode Works
+
+For a component whose `k8s_deploy_name` has a `PaymentHubDeployment` CR (every PHEE service), `localdev.py`:
+
+1. Resolves the host path and the boot jar, as k8s-direct mode does.
+2. Sets `spec.localDev` on the CR with `kubectl patch --type merge`:
+   ```yaml
+   spec:
+     localDev:
+       enabled: true
+       hostPath: /home/you/paymenthub-ee-data-pipeline/importer-rdbms
+       jarPath: /app/build/libs/importer-rdbms.jar   # springboot
+       image: eclipse-temurin:21                     # from localdev.ini
+       # mountPath: /usr/share/nginx/html            # webapp: no jarPath, image kept
+   ```
+3. Waits for the operator to re-render the Deployment, which then carries the annotation `paymenthub.mifos.org/local-dev: <hostPath>`, and for the rollout.
+
+The operator renders the same Deployment it always does (env vars, ConfigMaps, probes, Services, Ingress). For a springboot component it swaps the image for the JDK image, runs `java -jar <jarPath>`, and mounts the host directory at `/app`. A webapp keeps its image and has the directory mounted over nginx's html root. Reconciles keep it that way.
+
+- `--restore` removes `spec.localDev`, and the operator puts the image back. There are no backup files.
+- `--restart` deletes the pod and waits for the replacement to be Ready. Use it after rebuilding the jar. Don't use `kubectl rollout restart`: the operator removes its annotation on the next reconcile, which restarts the pod a second time.
+
+**The operator only honours `spec.localDev` when it runs with `LOCALDEV_ENABLED=true`.** `paymenthub.sh` sets that on local clusters (`environment = local`, k3s or Colima) and never on remote ones. If it isn't set, `localdev.py` warns you, and the operator logs that it's ignoring the field. On a cluster deployed before this change, either redeploy PaymentHub or run:
+```bash
+kubectl apply -f ~/mifos-gazelle/src/deployer/operators/paymenthub/config/crd/paymenthub-ee-CustomResourceDefinition.yaml
+kubectl set env deployment/paymenthub-ee-operator -n paymenthub LOCALDEV_ENABLED=true
+```
+This also needs an operator build that includes PHEE-455 (openMF/paymenthub-ee-k8s-operators). Until a published image has it, run the operator from a local build ([below](#running-the-operator-from-a-local-build)).
+
+A full redeploy (`./run.sh -m deploy`) reapplies the CR files with `kubectl apply`, which keeps a `localDev` that `localdev.py` added. `cleanapps` deletes the CRs, so a fresh deploy starts on images.
+
+---
+
+## How k8s-direct mode Works
+
+Used for components without a `PaymentHubDeployment` CR, which in practice means the operator itself. The patcher:
 
 1. Runs `kubectl get deployment <name> -n <namespace> -o json` to fetch the live Deployment
 2. Saves the original as a JSON backup at `~/.localdev-backups/<component>-deployment.json`
@@ -74,13 +151,7 @@ For components with `k8s_deploy_name` in `localdev.ini`, the patcher:
 
 `--restore` re-applies the original JSON backup and deletes the backup file.
 
-> **Operator reconciliation:** The in-cluster PaymentHub operator reconciles the 19 `PaymentHubDeployment`-managed components periodically and will revert k8s-direct patches to *those*. Scale it down while developing one of them:
-> ```bash
-> kubectl scale deployment paymenthub-ee-operator -n paymenthub --replicas=0
-> # ... develop ...
-> kubectl scale deployment paymenthub-ee-operator -n paymenthub --replicas=1
-> ```
-> This does **not** apply when patching the operator itself (`paymenthub-operator` in the table below) — its own Deployment is applied directly by `paymenthub.sh`, not reconciled by anything, so nothing reverts a patch to it.
+Nothing reconciles the operator's own Deployment (`paymenthub.sh` applies it directly), so a direct patch to it stays. A direct patch to a CR-managed component would be reverted by the operator, which is why those use CR mode.
 
 ---
 
@@ -111,9 +182,15 @@ For components with `k8s_deploy_name` in `localdev.ini`, the patcher:
 ./localdev.py
 ./localdev.py --component importer-rdbms
 
-# Restore all deployments from backups
+# Back to the image (CR mode removes spec.localDev; k8s-direct restores its backup)
 ./localdev.py --restore
 ./localdev.py --restore --component importer-rdbms
+
+# Pick up a rebuilt jar (deletes the pod, waits for the new one to be Ready)
+./localdev.py --restart --component importer-rdbms
+
+# Delete k8s-direct backups whose Deployment a redeploy has already put back on the image
+./localdev.py --clean-backups
 
 # Use a custom config file
 ./localdev.py --config /path/to/custom.ini
@@ -127,7 +204,7 @@ For components with `k8s_deploy_name` in `localdev.ini`, the patcher:
 cd ~/paymenthub-ee-data-pipeline/importer-rdbms
 # ... edit Java files ...
 ./gradlew bootJar          # Java 21
-kubectl delete pod -n paymenthub -l app=paymenthub-ee-importer-rdbms
+~/mifos-gazelle/src/utils/localdev/localdev.py --restart --component importer-rdbms
 kubectl logs -f -n paymenthub -l app=paymenthub-ee-importer-rdbms
 ```
 
@@ -165,10 +242,11 @@ Per ticket:
 
 | Fields present | Mode | Effect |
 |---------------|------|--------|
-| `k8s_deploy_name` | k8s-direct | Patches live Kubernetes Deployment + hostPath mount |
+| `k8s_deploy_name`, with a `PaymentHubDeployment` CR of that name | CR | Sets `spec.localDev`; the operator renders the hostPath Deployment |
+| `k8s_deploy_name`, no CR | k8s-direct | Patches the live Kubernetes Deployment + hostPath mount |
 | `checkout_enabled` only | checkout-only | Clones/updates repo; no deployment patching |
 
-The operator itself (`paymenthub-operator`) uses plain k8s-direct mode too — its Deployment is applied directly by `paymenthub.sh`, not by itself, so there's no reconciler to fight the patch.
+The mode is picked at run time by checking whether the CR exists. The operator itself (`paymenthub-operator`) has no CR, so it uses k8s-direct mode.
 
 ### Configuration Parameters
 
@@ -253,7 +331,7 @@ cd ~/mifos-gazelle/src/utils/localdev
 
 cd ~/paymenthub-ee-k8s-operators/paymenthub-operator
 ./gradlew bootJar
-kubectl delete pod -n paymenthub -l app=paymenthub-ee-operator   # pick up the new JAR
+~/mifos-gazelle/src/utils/localdev/localdev.py --restart --component paymenthub-operator   # pick up the new JAR
 
 kubectl logs -f -n paymenthub -l app=paymenthub-ee-operator
 
@@ -306,13 +384,12 @@ Common causes:
 - JAR not yet built — run `./gradlew bootJar` (localdev refuses to patch when `build/libs` has no boot jar)
 - `hostpath` directory does not exist on the node
 
-### Patch reverted by operator
-The in-cluster PaymentHub operator reconciles Deployments and will overwrite patches. Scale it down:
-```bash
-kubectl scale deployment paymenthub-ee-operator -n paymenthub --replicas=0
-```
+### Component still runs its image after `localdev.py`
+- **The operator ignores `spec.localDev`:** check `kubectl logs deploy/paymenthub-ee-operator -n paymenthub | grep localDev`. It needs `LOCALDEV_ENABLED=true` and an operator build with PHEE-455 (see [CR mode](#how-cr-mode-works)).
+- **The CRD predates `localDev`:** the API server then drops the field. Check with `kubectl get paymenthubdeployment <name> -n paymenthub -o jsonpath='{.spec.localDev}'`, and apply the CRD from `src/deployer/operators/paymenthub/config/crd/` if it's empty.
 
-### Restore fails
+### Restore fails (k8s-direct)
+CR-mode components have no backup; `--restore` just removes `spec.localDev`. For a k8s-direct component:
 ```bash
 # Check backup exists
 ls ~/.localdev-backups/
@@ -326,9 +403,9 @@ rm ~/.localdev-backups/<component>-deployment.json
 When using hostPath mounts, the Spring Boot JAR contains the compiled YAML configuration. Editing `application.yaml` alone is not sufficient — rebuild the JAR:
 ```bash
 ./gradlew bootJar
-kubectl delete pod -n paymenthub -l app=your-component
+~/mifos-gazelle/src/utils/localdev/localdev.py --restart --component <name>
 ```
-ConfigMap changes do NOT take effect when using hostPath mounts — the in-JAR config takes precedence.
+Environment variables from the CR or ConfigMaps still apply and override the in-JAR `application.yaml`, as they do for the image.
 
 ### Permission denied on hostPath
 ```bash
@@ -341,5 +418,5 @@ chmod 644 ~/your-project/build/libs/*.jar
 ## Notes
 
 - **Single-node only:** `hostPath` is node-specific. This tooling is designed for single-node k3s local development.
-- **After operator reconcile:** k8s-direct patches may be overwritten. Scale down the operator or re-run `./localdev.py --component <name>` (run `--restore` first if backup already exists).
+- **Redeploys:** `./run.sh -m deploy` keeps CR-mode `localDev` settings, but reapplies the operator's own Deployment, which undoes a k8s-direct patch. `--status` then shows a stale backup; run `--clean-backups`, then `--setup` again.
 - **Remote debugging:** Add JVM debug flags to the command in the patched deployment, then `kubectl port-forward deployment/your-component 5005:5005 -n paymenthub`.

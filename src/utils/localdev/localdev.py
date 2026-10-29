@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-localdev.py - Patches live Kubernetes Deployments for local development
-Modifies Deployments to use hostPath volumes and custom images for rapid iteration
+localdev.py - Runs PHEE components from local builds for local development
+Operator-managed components (PaymentHubDeployment CRs) get spec.localDev set on
+their CR, and the operator renders the hostPath Deployment (PHEE-455). Anything
+without a CR (the operator itself) has its live Deployment patched directly.
 Also handles checking out GitHub repositories for components
 """
 
@@ -441,8 +443,8 @@ class LocalDevPatcher:
         print(f"✅ Complete setup finished: {success_count}/{len(components)} components")
         print(f"{'=' * 60}\n")
     
-    def _visual_ljust(self, s: str, width: int) -> str:
-        """Left-justify to terminal display width, treating wide emoji as 2 chars."""
+    def _visual_width(self, s: str) -> int:
+        """Terminal display width, treating wide emoji as 2 chars."""
         import unicodedata
         vis_w = 0
         for ch in s:
@@ -453,7 +455,11 @@ class LocalDevPatcher:
                 vis_w += 0  # combining / variation-selector chars (e.g. U+FE0F after ⚠)
             else:
                 vis_w += 1
-        return s + ' ' * max(0, width - vis_w)
+        return vis_w
+
+    def _visual_ljust(self, s: str, width: int) -> str:
+        """Left-justify to terminal display width."""
+        return s + ' ' * max(0, width - self._visual_width(s))
 
     def status_all(self):
         """Show compact table status of all components."""
@@ -477,6 +483,22 @@ class LocalDevPatcher:
         except Exception:
             pass
 
+        # Deployments the operator rendered from spec.localDev carry this annotation.
+        local_dev_annotations = set()
+        try:
+            result = subprocess.run(
+                ['kubectl', 'get', 'deployments', '-n', 'paymenthub', '-o',
+                 'jsonpath={range .items[*]}{.metadata.name}={.metadata.annotations.paymenthub\\.mifos\\.org/local-dev}{"\\n"}{end}'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    name, _, value = line.partition('=')
+                    if value.strip():
+                        local_dev_annotations.add(name.strip())
+        except Exception:
+            pass
+
         backup_dir = Path.home() / '.localdev-backups'
 
         patchable_rows = []
@@ -487,16 +509,17 @@ class LocalDevPatcher:
                 continue
             comp_config = self.config[component]
 
-            # ── Repo column ───────────────────────────────────────────────────
+            # ── Branch / upstream columns ─────────────────────────────────────
             info = self._repo_info(component) if comp_config.get('checkout_enabled', '').lower() == 'true' else None
+            up_col = "—"
             if info:
                 if self._repo_exists(info['path']):
                     current = self._get_current_branch(info['path'])
                     expected = info['branch']
-                    co_col = f"✅ {current}" if current == expected else f"⚠️  {current} (want {expected})"
+                    co_col = f"✅ {current}" if current == expected else f"⚠️  {current} (ini: {expected})"
                     behind = self._behind_base(info)
-                    if behind:
-                        co_col += f" ↓{behind}"
+                    if behind is not None:
+                        up_col = f"{behind} behind" if behind else "current"
                 else:
                     co_col = "❌ not cloned"
             else:
@@ -527,30 +550,37 @@ class LocalDevPatcher:
                 # the deployment with a registry image (not a local JAR image).
                 backup_is_stale = backup_file.exists() and in_cluster and not live_hostpath
 
-                if backup_file.exists() and live_hostpath:
-                    cluster_col = "🔧 LOCAL  (hostpath JAR)"
+                local = "local files" if app_type_comp == 'webapp' else "local JAR"
+                if deploy_name in local_dev_annotations:
+                    cluster_col = f"🔧 {local}  (CR)"
+                    is_patched = True
+                elif backup_file.exists() and live_hostpath:
+                    cluster_col = f"🔧 {local}  (direct)"
                     is_patched = True
                 elif backup_is_stale:
                     _, tag = k8s_images[deploy_name]
-                    cluster_col = f"image  {tag}  (stale backup — run --clean-backups)"
+                    cluster_col = f"📦 image {tag}  (stale backup — run --clean-backups)"
                 elif backup_file.exists() and in_cluster:
                     _, tag = k8s_images[deploy_name]
-                    cluster_col = f"⚠️  reverted → image  {tag}"
+                    cluster_col = f"⚠️  reverted → image {tag}"
                 elif backup_file.exists():
                     cluster_col = "⚠️  reverted → not deployed"
                 elif in_cluster:
                     _, tag = k8s_images[deploy_name]
-                    cluster_col = f"image  {tag}"
+                    cluster_col = f"📦 image {tag}"
                 else:
                     cluster_col = "not deployed"
-                patchable_rows.append({'name': component, 'co': co_col, 'cluster': cluster_col, 'is_patched': is_patched})
+                patchable_rows.append({'name': component, 'co': co_col, 'up': up_col,
+                                       'cluster': cluster_col, 'is_patched': is_patched})
             else:
-                checkout_rows.append({'name': component, 'co': co_col})
+                checkout_rows.append({'name': component, 'co': co_col, 'up': up_col})
 
         all_named = patchable_rows + checkout_rows
-        W      = 72
         name_w = max((len(r['name']) for r in all_named), default=12) + 2
-        co_w   = 22
+        co_w   = max((self._visual_width(r['co']) for r in all_named), default=6) + 2
+        up_w   = max(len('UPSTREAM'), *(len(r['up']) for r in all_named)) + 2
+        cl_w   = max((self._visual_width(r['cluster']) for r in patchable_rows), default=7)
+        W      = min(max(72, name_w + co_w + up_w + cl_w + 4), 110)
 
         print(f"\n{'═' * W}")
         print(f"  Local Dev Status")
@@ -563,19 +593,28 @@ class LocalDevPatcher:
             else:
                 print(f"  {'─' * (W - 4)}")
 
+        def row(r, cluster=''):
+            print(f"  {self._visual_ljust(r['name'], name_w)}{self._visual_ljust(r['co'], co_w)}"
+                  f"{r['up']:<{up_w}}{cluster}".rstrip())
+
         # Patchable components table
-        divider('k8s-direct  (patchable)')
-        print(f"  {'COMPONENT':<{name_w}}  {'REPO':<{co_w}}  CLUSTER")
+        divider('deployable  (run your build in the cluster)')
+        print(f"  {'COMPONENT':<{name_w}}{'BRANCH':<{co_w}}{'UPSTREAM':<{up_w}}RUNNING")
         divider()
         for r in patchable_rows:
-            print(f"  {self._visual_ljust(r['name'], name_w)}  {self._visual_ljust(r['co'], co_w)}  {r['cluster']}")
+            row(r, r['cluster'])
 
         # Checkout-only
         divider('checkout only')
-        print(f"  {'COMPONENT':<{name_w}}  REPO")
+        print(f"  {'COMPONENT':<{name_w}}{'BRANCH':<{co_w}}UPSTREAM")
         divider()
         for r in checkout_rows:
-            print(f"  {self._visual_ljust(r['name'], name_w)}  {r['co']}")
+            row(r)
+
+        print("\n  BRANCH    ✅ = branch_or_tag in localdev.ini   ⚠️  = other branch (ini: what the ini says)")
+        print("  UPSTREAM  commits on upstream/<base_branch> missing from your branch, as of last fetch")
+        print("  RUNNING   🔧 your build — (CR) via spec.localDev, (direct) patched Deployment;"
+              "  📦 registry image")
 
         print(f"\n{'═' * W}\n")
 
@@ -648,9 +687,12 @@ class LocalDevPatcher:
 
         comp_config = self.config[component]
 
-        # All patchable components (including the operator itself) are
-        # k8s-direct: patch the live Deployment via kubectl.
+        # Components with a PaymentHubDeployment CR are switched through the CR so the
+        # operator keeps them on the local build; the rest (the operator itself) are
+        # patched directly.
         if comp_config.get('k8s_deploy_name'):
+            if self._has_cr(component):
+                return self._patch_cr(component, dry_run)
             return self._patch_k8s_deployment(component, dry_run)
 
         print(f"\n⏭️  Skipping {component} - checkout-only component, no deployment to patch")
@@ -808,6 +850,139 @@ class LocalDevPatcher:
         )
         return True
 
+    # ── Operator-managed components: spec.localDev on the CR (PHEE-455) ──────────
+
+    CR_KIND = 'paymenthubdeployments.gazelle.mifos.io'
+    LOCALDEV_ANNOTATION = 'paymenthub.mifos.org/local-dev'
+    OPERATOR_DEPLOYMENT = 'paymenthub-ee-operator'
+
+    def _kubectl(self, *args: str, input: Optional[str] = None) -> subprocess.CompletedProcess:
+        return subprocess.run(['kubectl', *args], input=input, capture_output=True, text=True)
+
+    def _has_cr(self, component: str) -> bool:
+        comp_config = self.config[component]
+        return self._kubectl('get', self.CR_KIND, comp_config['k8s_deploy_name'],
+                             '-n', comp_config.get('k8s_namespace', 'paymenthub')).returncode == 0
+
+    def _operator_allows_localdev(self, namespace: str) -> bool:
+        result = self._kubectl('get', 'deployment', self.OPERATOR_DEPLOYMENT, '-n', namespace, '-o',
+                               'jsonpath={.spec.template.spec.containers[0].env[?(@.name=="LOCALDEV_ENABLED")].value}')
+        return result.returncode == 0 and result.stdout.strip().lower() == 'true'
+
+    def _deployment_annotation(self, name: str, namespace: str) -> str:
+        result = self._kubectl('get', 'deployment', name, '-n', namespace, '-o',
+                               "jsonpath={.metadata.annotations['paymenthub\\.mifos\\.org/local-dev']}")
+        return result.stdout.strip() if result.returncode == 0 else ''
+
+    def _wait_for_operator(self, name: str, namespace: str, want_local: bool, timeout_s: int = 90) -> bool:
+        """Wait until the operator has re-rendered the Deployment, then for its rollout."""
+        import time
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if bool(self._deployment_annotation(name, namespace)) == want_local:
+                subprocess.run(['kubectl', 'rollout', 'status', 'deployment', name,
+                                '-n', namespace, '--timeout=180s'])
+                return True
+            time.sleep(2)
+        print(f"  ⚠️  The operator hasn't re-rendered {name} after {timeout_s}s — "
+              f"check: kubectl logs deploy/{self.OPERATOR_DEPLOYMENT} -n {namespace}")
+        return False
+
+    def _patch_cr(self, component: str, dry_run: bool = False) -> bool:
+        """Set spec.localDev on the component's CR from localdev.ini."""
+        import json as _json
+
+        comp_config = self.config[component]
+        name = comp_config['k8s_deploy_name']
+        namespace = comp_config.get('k8s_namespace', 'paymenthub')
+        app_type = comp_config.get('app_type', 'springboot')
+        hostpath = self._hostpath(component)
+
+        print(f"\n{'[DRY RUN] ' if dry_run else ''}Processing {component} (operator CR: spec.localDev)...")
+        if not Path(hostpath).is_dir():
+            print(f"  ❌ Host path {hostpath} does not exist — run --checkout first")
+            return False
+
+        local_dev = {'enabled': True, 'hostPath': hostpath}
+        if app_type == 'springboot':
+            jarpath = self._resolve_jarpath(component, hostpath)
+            if not jarpath:
+                return False
+            local_dev['jarPath'] = jarpath
+            if comp_config.get('image'):
+                local_dev['image'] = comp_config['image']
+        elif app_type == 'webapp':
+            local_dev['mountPath'] = '/usr/share/nginx/html'
+
+        print(f"  📦 CR         : {name}  ns: {namespace}")
+        for key in ('image', 'jarPath', 'hostPath', 'mountPath'):
+            if key in local_dev:
+                print(f"  {'🔗' if key == 'hostPath' else '📦'} {key:<11}: {local_dev[key]}")
+
+        if not self._operator_allows_localdev(namespace):
+            print(f"  ⚠️  The operator isn't running with LOCALDEV_ENABLED=true, so it will ignore "
+                  f"spec.localDev. Redeploy PaymentHub on a local cluster, or set it with:\n"
+                  f"      kubectl set env deployment/{self.OPERATOR_DEPLOYMENT} -n {namespace} LOCALDEV_ENABLED=true")
+
+        if dry_run:
+            print(f"  ℹ️  Would set spec.localDev on {name} (dry run)")
+            return True
+
+        result = self._kubectl('patch', self.CR_KIND, name, '-n', namespace, '--type', 'merge',
+                               '-p', _json.dumps({'spec': {'localDev': local_dev}}))
+        if result.returncode != 0:
+            print(f"  ❌ kubectl patch failed: {result.stderr.strip()}")
+            return False
+        print(f"  ✅ spec.localDev set — waiting for the operator...")
+        self._wait_for_operator(name, namespace, want_local=True)
+        # The operator re-renders the whole Deployment, so an earlier direct patch is gone.
+        old_backup = Path.home() / '.localdev-backups' / f"{component}-deployment.json"
+        if old_backup.exists():
+            old_backup.unlink()
+            print(f"  🗑  Removed old direct-patch backup {old_backup}")
+        print(f"  💡 After rebuilding: ./localdev.py --restart --component {component}")
+        return True
+
+    def _restore_cr(self, component: str) -> bool:
+        """Remove spec.localDev so the operator puts the image back."""
+        comp_config = self.config[component]
+        name = comp_config['k8s_deploy_name']
+        namespace = comp_config.get('k8s_namespace', 'paymenthub')
+
+        current = self._kubectl('get', self.CR_KIND, name, '-n', namespace, '-o', 'jsonpath={.spec.localDev}')
+        if not current.stdout.strip():
+            if (Path.home() / '.localdev-backups' / f"{component}-deployment.json").exists():
+                return self._restore_k8s_deployment(component)   # patched directly before PHEE-455
+            print(f"⏭️  {component}: spec.localDev not set — already on its image")
+            return True
+        result = self._kubectl('patch', self.CR_KIND, name, '-n', namespace, '--type', 'merge',
+                               '-p', '{"spec":{"localDev":null}}')
+        if result.returncode != 0:
+            print(f"  ❌ kubectl patch failed: {result.stderr.strip()}")
+            return False
+        print(f"✅ Removed spec.localDev from {component} — waiting for the operator...")
+        self._wait_for_operator(name, namespace, want_local=False)
+        return True
+
+    def restart_component(self, component: str) -> bool:
+        """Delete the component's pods so the replacements load the rebuilt jar.
+        (Not `rollout restart`: the operator strips its annotation on the next reconcile.)"""
+        if component not in self.config or not self.config[component].get('k8s_deploy_name'):
+            print(f"❌ Component '{component}' has no k8s_deploy_name in localdev.ini")
+            return False
+        comp_config = self.config[component]
+        name = comp_config['k8s_deploy_name']
+        namespace = comp_config.get('k8s_namespace', 'paymenthub')
+        print(f"🔄 Restarting {component}...")
+        # --wait: return once the old pods are gone, so the Ready wait below only sees replacements.
+        result = self._kubectl('delete', 'pod', '-n', namespace, '-l', f'app={name}', '--wait=true')
+        if result.returncode != 0:
+            print(f"  ❌ kubectl delete pod failed: {result.stderr.strip()}")
+            return False
+        result = subprocess.run(['kubectl', 'wait', '--for=condition=Ready', 'pod', '-l', f'app={name}',
+                                 '-n', namespace, '--timeout=300s'])
+        return result.returncode == 0
+
     def _resolve_jarpath(self, component: str, hostpath: str) -> Optional[str]:
         """
         Container path of the jar to run. Uses jarpath when set and present on the
@@ -880,6 +1055,8 @@ class LocalDevPatcher:
         comp_config = self.config[component]
 
         if comp_config.get('k8s_deploy_name'):
+            if self._has_cr(component):
+                return self._restore_cr(component)
             return self._restore_k8s_deployment(component)
 
         print(f"\n⏭️  Skipping {component} - checkout-only component, nothing to restore")
@@ -959,6 +1136,9 @@ Examples:
 
   # Restore specific component
   ./localdev.py --restore --component bulk-processor
+
+  # Pick up a rebuilt jar
+  ./localdev.py --restart --component bulk-processor
         """
     )
     
@@ -1002,6 +1182,11 @@ Examples:
         help='Show status of all components (repos and deployments)'
     )
     parser.add_argument(
+        '--restart',
+        action='store_true',
+        help='Restart the component pod(s) to pick up a rebuilt jar (use with --component)'
+    )
+    parser.add_argument(
         '--clean-backups',
         action='store_true',
         help='Remove stale localdev backup files whose deployments have been replaced by a full redeploy'
@@ -1014,6 +1199,11 @@ Examples:
 
         if args.clean_backups:
             patcher.clean_backups()
+        elif args.restart:
+            if not args.component:
+                print("❌ --restart needs --component")
+                sys.exit(1)
+            patcher.restart_component(args.component)
         elif args.status:
             patcher.status_all()
         elif args.checkout:
